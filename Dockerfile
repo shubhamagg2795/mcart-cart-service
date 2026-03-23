@@ -1,14 +1,7 @@
-﻿FROM maven:3.9.6-eclipse-temurin-17 AS builder
+﻿FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY pom.xml .
-RUN mvn dependency:go-offline -q
-COPY src ./src
-RUN mvn clean package -DskipTests -q
-
-FROM eclipse-temurin:17-jre-alpine
-WORKDIR /app
-COPY --from=builder /app/target/*.jar app.jar
+COPY app.jar app.jar
 RUN addgroup -S mcart && adduser -S mcart -G mcart
 USER mcart
 EXPOSE 8081
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-Xmx128m", "-Xms64m", "-XX:+UseG1GC", "-jar", "app.jar"]

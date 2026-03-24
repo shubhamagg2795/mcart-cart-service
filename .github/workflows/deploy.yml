@@ -23,8 +23,6 @@ jobs:
           echo "Commit   : ${{ github.sha }}"
           echo "Author   : ${{ github.actor }}"
           echo "Message  : ${{ github.event.head_commit.message }}"
-          echo "Changed files:"
-          git diff --name-only HEAD~1 HEAD || echo "Initial commit"
 
   build:
     name: "Stage 2 — Build & Compile"
@@ -81,30 +79,20 @@ jobs:
       - name: Check for hardcoded secrets
         run: |
           echo "Scanning for hardcoded secrets..."
-          if grep -r "password\s*=\s*['\"][^$]" src/ --include="*.java" | grep -v "test" | grep -v "//" ; then
-            echo "WARNING: Possible hardcoded passwords found"
-          else
-            echo "No hardcoded secrets found - clean"
-          fi
+          grep -r "password\s*=" src/ --include="*.java" | grep -v "test" | grep -v "//" || echo "No hardcoded secrets found - clean"
 
   integration-test:
     name: "Stage 5 — Integration Test"
     runs-on: ubuntu-latest
     needs: security-scan
     steps:
-      - name: Check EC2 backend connectivity
+      - name: Check EC2 connectivity
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            http://${{ secrets.EC2_HOST }}/health || echo "000")
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.EC2_HOST }}/health || echo "000")
           echo "EC2 Gateway status: $STATUS"
-          if [ "$STATUS" = "200" ]; then
-            echo "Backend is reachable"
-          else
-            echo "Backend unreachable - continuing anyway"
-          fi
 
-  docker-build:
-    name: "Stage 6 — Build Docker Image"
+  docker-build-push:
+    name: "Stage 6 — Build & Push Docker Image"
     runs-on: ubuntu-latest
     needs: integration-test
     steps:
@@ -114,50 +102,28 @@ jobs:
         with:
           name: cart-jar
           path: target/
-      - name: Copy JAR to root for Docker build
+      - name: Copy JAR to root
         run: cp target/*.jar app.jar
-      - name: Build Docker image
-        run: |
-          docker build -t mcart-cart-service:${{ github.sha }} .
-          docker tag mcart-cart-service:${{ github.sha }} mcart-cart-service:latest
-          docker images mcart-cart-service
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/mcart-cart-service:latest
+            ${{ secrets.DOCKER_USERNAME }}/mcart-cart-service:${{ github.sha }}
 
   deploy:
     name: "Stage 7 — Deploy to EC2"
     runs-on: ubuntu-latest
-    needs: docker-build
+    needs: docker-build-push
     steps:
-      - name: Download JAR
-        uses: actions/download-artifact@v4
-        with:
-          name: cart-jar
-          path: target/
-      - name: Copy JAR to EC2
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          source: "target/*.jar"
-          target: "/home/ubuntu/mcart/mcart-cart-service/"
-          strip_components: 1
-      - name: Rename to app.jar
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            cd /home/ubuntu/mcart/mcart-cart-service
-            mv *.jar app.jar 2>/dev/null || true
-            echo "Cart JAR deployed to EC2 at $(date)"
-
-  docker-restart:
-    name: "Stage 8 — Docker Build & Restart"
-    runs-on: ubuntu-latest
-    needs: deploy
-    steps:
-      - name: Rebuild and restart container
+      - name: Pull and restart on EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -165,28 +131,37 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             cd /home/ubuntu/mcart
-            docker-compose build cart-service
+            docker pull ${{ secrets.DOCKER_USERNAME }}/mcart-cart-service:latest
             docker-compose up -d --no-deps cart-service
-            echo "Cart Service restarted at $(date)"
+            echo "Cart Service deployed at $(date)"
+
+  docker-verify:
+    name: "Stage 8 — Verify Container Running"
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Check container status
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/mcart
             docker-compose ps cart-service
 
   smoke-test:
     name: "Stage 9 — Smoke Test"
     runs-on: ubuntu-latest
-    needs: docker-restart
+    needs: docker-verify
     steps:
-      - name: Wait for service to start
+      - name: Wait for service
         run: sleep 20
       - name: Health check
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            http://${{ secrets.EC2_HOST }}/api/cart/health || echo "000")
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.EC2_HOST }}/api/cart/health || echo "000")
           echo "Cart Service status: $STATUS"
-          if [ "$STATUS" = "200" ]; then
-            echo "PASSED - Cart Service is healthy"
-          else
-            echo "WARNING - Service returned $STATUS"
-          fi
+          [ "$STATUS" = "200" ] && echo "PASSED" || echo "WARNING: $STATUS"
 
   notify-summary:
     name: "Stage 10 — Notify & Summary"
@@ -197,9 +172,7 @@ jobs:
         run: |
           echo "========================================"
           echo "  Cart Service Deployment Complete!"
-          echo "  Commit  : ${{ github.sha }}"
-          echo "  Branch  : ${{ github.ref_name }}"
-          echo "  Author  : ${{ github.actor }}"
-          echo "  Time    : $(date -u)"
-          echo "  URL     : http://${{ secrets.EC2_HOST }}/api/cart/health"
+          echo "  Image  : ${{ secrets.DOCKER_USERNAME }}/mcart-cart-service:latest"
+          echo "  Commit : ${{ github.sha }}"
+          echo "  Time   : $(date -u)"
           echo "========================================"
